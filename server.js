@@ -9,6 +9,68 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
+
+// ── STRIPE WEBHOOK ────────────────────────────────────────────────────────────
+// Must be registered before express.json() so we receive the raw body for sig verification
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const SUPA_URL = 'https://wukwvcxeejsqaqhvknfo.supabase.co';
+
+async function setUserPaidStatus(email, paid) {
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  // Find user by email
+  const listRes = await fetch(`${SUPA_URL}/auth/v1/admin/users?per_page=1000`, {
+    headers: { 'apikey': key, 'Authorization': 'Bearer ' + key }
+  });
+  if (!listRes.ok) throw new Error('Failed to list Supabase users');
+  const { users } = await listRes.json();
+  const user = users.find(u => u.email === email);
+  if (!user) throw new Error(`No Supabase user found for email: ${email}`);
+
+  // Merge paid flag into existing metadata
+  const updatedMeta = { ...(user.user_metadata || {}), paid };
+  const updateRes = await fetch(`${SUPA_URL}/auth/v1/admin/users/${user.id}`, {
+    method: 'PUT',
+    headers: { 'apikey': key, 'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_metadata: updatedMeta })
+  });
+  if (!updateRes.ok) {
+    const err = await updateRes.json();
+    throw new Error('Failed to update user metadata: ' + JSON.stringify(err));
+  }
+  console.log(`✅ Supabase user ${email} paid=${paid}`);
+}
+
+app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('⚠️  Stripe webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const email = event.data.object.customer_details?.email || event.data.object.customer_email;
+      if (email) await setUserPaidStatus(email, true);
+    } else if (event.type === 'customer.subscription.created') {
+      const customerId = event.data.object.customer;
+      const customer = await stripe.customers.retrieve(customerId);
+      if (customer.email) await setUserPaidStatus(customer.email, true);
+    } else if (event.type === 'customer.subscription.deleted') {
+      const customerId = event.data.object.customer;
+      const customer = await stripe.customers.retrieve(customerId);
+      if (customer.email) await setUserPaidStatus(customer.email, false);
+    }
+  } catch (err) {
+    console.error('⚠️  Webhook handler error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+
+  res.json({ received: true });
+});
+
 app.use(express.json());
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
